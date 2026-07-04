@@ -1,0 +1,75 @@
+// -----------------------------------------------------------------------------
+// AlphaMovie プラグイン 実機デコードテスト
+//
+//   krkrz64.exe をこのフォルダ(test)を引数に起動すると自動実行される起動スクリプト。
+//   AlphaMovie.dll を読み込み、このフォルダに置かれた *.amv を開いて各種プロパティを
+//   検証し、フレームをデコードして Layer へ描画、結果を PNG に保存する。
+//   PNG を目視することでデコードの正しさ(色/アルファ/DC 予測)を確認できる。
+//   実行手順は同フォルダの readme.txt 参照。
+// -----------------------------------------------------------------------------
+var fails = 0;
+function log(s) { Debug.message(s); }
+function check(cond, name) {
+	if (cond) { log("OK   : " + name); }
+	else { log("FAIL : " + name); fails++; }
+}
+try { Debug.startLogToFile(true); } catch(e) {}
+
+log("==== AlphaMovie decode test start ====");
+try {
+	Plugins.link("AlphaMovie.dll");
+	log("plugin linked");
+} catch(e) {
+	log("PLUGIN LINK FAILED: " + e.message);
+	System.exit(90);
+}
+
+// このフォルダに置かれた検証用 .amv (無い物はスキップ)
+var files = ["explosion", "particle", "water", "maho2"];
+
+try {
+	var win = new Window();
+	win.setInnerSize(800, 600);
+
+	var tested = 0;
+	for (var fi = 0; fi < files.count; fi++) {
+		var name = files[fi];
+		if (!Storages.isExistentStorage(name + ".amv")) {
+			log("skip (not found): " + name + ".amv");
+			continue;
+		}
+		tested++;
+		var am = new AlphaMovie();
+		am.open(name + ".amv");
+		log("[" + name + "] frames=" + am.numOfFrame +
+			" size=" + am.screenWidth + "x" + am.screenHeight +
+			" fps=" + am.FPSRate + "/" + am.FPSScale);
+		check(am.numOfFrame > 0 && am.screenWidth > 0 && am.screenHeight > 0, name + " header");
+
+		var lay = new Layer(win, null);
+		lay.setImageSize(am.screenWidth, am.screenHeight);
+		lay.setSizeToImageSize();
+		lay.fillRect(0, 0, lay.imageWidth, lay.imageHeight, 0x00000000);
+
+		// 中盤フレームまで進めて累積描画 → PNG 保存 (目視検証用)
+		var target = am.numOfFrame > 20 ? 20 : (am.numOfFrame - 1);
+		var fno = 0;
+		for (var i = 0; i <= target; i++) fno = am.showNextImage(lay);
+		check(fno == target, name + " frame number");
+		lay.saveLayerImage("amv_" + name + ".png", "png");
+		log("  saved amv_" + name + ".png (frame " + fno + ")");
+
+		// frame プロパティによるシーク
+		am.frame = 0;
+		check(am.frame == 0, name + " seek to 0");
+
+		invalidate lay;
+		invalidate am;
+	}
+	check(tested > 0, "at least one .amv tested");
+	log("==== done. fails=" + fails + " ====");
+} catch(e) {
+	log("EXCEPTION: " + e.message);
+	fails += 100;
+}
+System.exit(fails);

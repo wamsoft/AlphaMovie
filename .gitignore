@@ -1,0 +1,7 @@
+build
+*.suo
+# test 実行時に配置/生成される検証用ファイル(リポジトリには同梱しない)
+test/*.amv
+test/*.png
+test/out.txt
+test/err.txt
