@@ -22,6 +22,12 @@
 //   そのため、標準ベースライン Huffman + IDCT の**自前デコーダ**を実装し、
 //   上記 2 共有予測子方式を忠実に再現する (Huffman/量子化は標準テーブル)。
 //   4:2:0 サブサンプリング / MCU=16x16。
+//   さらにオリジナル (32bit 版) と画素一致させるため、以下もオリジナルに揃えている:
+//     ・エントロピーは 32bit ビッグエンディアン読みで、0xFF00 のバイトスタッフは無い
+//     ・量子化テーブルはファイル上で自然順 (ジグザグ順ではない)
+//     ・IDCT は libjpeg jpeg_idct_islow 相当の整数演算、色変換は libjpeg の丸め付き式
+//     ・MCU 内の全ブロックが AC 無しのときは (DC*q >> 3) + 128 で塗る高速経路
+//     ・描画先レイヤはフレームの大きさに合わせ、(left,top) へ移動して update する
 //---------------------------------------------------------------------------
 
 #include "ncbind.hpp"
@@ -151,7 +157,10 @@ struct HuffTable {
 	}
 };
 
-// エントロピー用ビットリーダ (JPEG 由来: 0xFF00 バイトスタッフを解除)
+// エントロピー用ビットリーダ
+//   オリジナルは 32bit ワードをビッグエンディアンで読み、上位ビットから消費する。
+//   標準 JPEG と違い 0xFF00 のバイトスタッフは無い (0xFF もそのままデータ)。
+//   ※ 0xFF00 を解除するとそれ以降の符号がずれて色が崩れる
 struct BitReader {
 	const tjs_uint8 *p, *end;
 	tjs_uint32 acc;   // 現在のバイトのビット
@@ -161,13 +170,7 @@ struct BitReader {
 	inline int bit() {
 		if (cnt == 0) {
 			if (p >= end) return 0;         // データ枯渇時は 0 で埋める
-			tjs_uint8 b = *p++;
-			if (b == 0xFF) {
-				// 0xFF00 は literal 0xFF、0xFFxx(marker) は終端扱い
-				if (p < end && *p == 0x00) p++;
-				else { /* marker: これ以上読まない */ }
-			}
-			acc = b; cnt = 8;
+			acc = *p++; cnt = 8;
 		}
 		cnt--;
 		return (acc >> cnt) & 1;
@@ -192,59 +195,93 @@ static inline int receive_extend(BitReader &br, int s) {
 	return v;
 }
 
-// 分離型 IDCT 用コサイン係数表  cosT[x][u] = 0.5 * c(u) * cos((2x+1)uπ/16)
-static double g_cosT[8][8];
-static bool   g_cosInit = false;
-static void initCos() {
-	if (g_cosInit) return;
-	const double PI = 3.14159265358979323846;
-	for (int x = 0; x < 8; x++)
-		for (int u = 0; u < 8; u++) {
-			double cu = (u == 0) ? (1.0 / 1.4142135623730951) : 1.0;
-			g_cosT[x][u] = 0.5 * cu * cos((2 * x + 1) * u * PI / 16.0);
+// 逆量子化 + IDCT (libjpeg jpeg_idct_islow と同じ整数演算。オリジナルもこれ)
+//   coef  : 自然順の量子化係数 (未逆量子化)
+//   quant : 自然順の量子化テーブル (ファイルの並びのまま)
+//   out   : 8x8 画素 (レベルシフト +128 / 0..255 クランプ)
+static void idctIslow(const int *coef, const tjs_uint8 *quant, tjs_uint8 *out /*[64] raster*/) {
+	const int CONST_BITS = 13, PASS1_BITS = 2;
+	int ws[64];
+	// 列方向
+	for (int c = 0; c < 8; c++) {
+		const int *in = coef + c;
+		const tjs_uint8 *q = quant + c;
+		int *w = ws + c;
+		if (in[8] == 0 && in[16] == 0 && in[24] == 0 && in[32] == 0 &&
+			in[40] == 0 && in[48] == 0 && in[56] == 0) {
+			int dc = (in[0] * q[0]) << PASS1_BITS;
+			for (int r = 0; r < 8; r++) w[r * 8] = dc;
+			continue;
 		}
-	g_cosInit = true;
-}
-
-// 自然順の逆量子化済み係数 coef[64] → 空間 8x8 (レベルシフト +128 / クランプ)
-static void idct8x8(const int *coef, tjs_uint8 *out /*[64] raster*/) {
-	double tmp[64];
-	// 行方向 (u について)
-	for (int v = 0; v < 8; v++) {
-		const int *row = coef + v * 8;
-		for (int x = 0; x < 8; x++) {
-			double s = 0.0;
-			for (int u = 0; u < 8; u++) s += g_cosT[x][u] * row[u];
-			tmp[v * 8 + x] = s;
-		}
+		int x0 = in[0] * q[0],   x1 = in[8] * q[8],   x2 = in[16] * q[16], x3 = in[24] * q[24];
+		int x4 = in[32] * q[32], x5 = in[40] * q[40], x6 = in[48] * q[48], x7 = in[56] * q[56];
+		int z1 = (x2 + x6) * 4433;
+		int tmp2 = z1 + x6 * -15137;
+		int tmp3 = z1 + x2 * 6270;
+		int tmp0 = (x0 + x4) << CONST_BITS;
+		int tmp1 = (x0 - x4) << CONST_BITS;
+		int t10 = tmp0 + tmp3, t13 = tmp0 - tmp3, t11 = tmp1 + tmp2, t12 = tmp1 - tmp2;
+		int o0 = x7, o1 = x5, o2 = x3, o3 = x1;
+		z1 = o0 + o3; int z2 = o1 + o2; int z3 = o0 + o2; int z4 = o1 + o3;
+		int z5 = (z3 + z4) * 9633;
+		o0 *= 2446; o1 *= 16819; o2 *= 25172; o3 *= 12299;
+		z1 *= -7373; z2 *= -20995; z3 *= -16069; z4 *= -3196;
+		z3 += z5; z4 += z5;
+		o0 += z1 + z3; o1 += z2 + z4; o2 += z2 + z3; o3 += z1 + z4;
+		const int R = 1 << (CONST_BITS - PASS1_BITS - 1), S = CONST_BITS - PASS1_BITS;
+		w[0]  = (t10 + o3 + R) >> S;  w[56] = (t10 - o3 + R) >> S;
+		w[8]  = (t11 + o2 + R) >> S;  w[48] = (t11 - o2 + R) >> S;
+		w[16] = (t12 + o1 + R) >> S;  w[40] = (t12 - o1 + R) >> S;
+		w[24] = (t13 + o0 + R) >> S;  w[32] = (t13 - o0 + R) >> S;
 	}
-	// 列方向 (v について)
-	for (int x = 0; x < 8; x++) {
-		for (int y = 0; y < 8; y++) {
-			double s = 0.0;
-			for (int v = 0; v < 8; v++) s += g_cosT[y][v] * tmp[v * 8 + x];
-			out[y * 8 + x] = clip8((int)floor(s + 128.0 + 0.5));
+	// 行方向
+	for (int r = 0; r < 8; r++) {
+		const int *w = ws + r * 8;
+		tjs_uint8 *o = out + r * 8;
+		if (w[1] == 0 && w[2] == 0 && w[3] == 0 && w[4] == 0 && w[5] == 0 && w[6] == 0 && w[7] == 0) {
+			tjs_uint8 v = clip8(((w[0] + (1 << (PASS1_BITS + 2))) >> (PASS1_BITS + 3)) + 128);
+			for (int c = 0; c < 8; c++) o[c] = v;
+			continue;
 		}
+		int z1 = (w[2] + w[6]) * 4433;
+		int tmp2 = z1 + w[6] * -15137;
+		int tmp3 = z1 + w[2] * 6270;
+		int tmp0 = (w[0] + w[4]) << CONST_BITS;
+		int tmp1 = (w[0] - w[4]) << CONST_BITS;
+		int t10 = tmp0 + tmp3, t13 = tmp0 - tmp3, t11 = tmp1 + tmp2, t12 = tmp1 - tmp2;
+		int o0 = w[7], o1 = w[5], o2 = w[3], o3 = w[1];
+		z1 = o0 + o3; int z2 = o1 + o2; int z3 = o0 + o2; int z4 = o1 + o3;
+		int z5 = (z3 + z4) * 9633;
+		o0 *= 2446; o1 *= 16819; o2 *= 25172; o3 *= 12299;
+		z1 *= -7373; z2 *= -20995; z3 *= -16069; z4 *= -3196;
+		z3 += z5; z4 += z5;
+		o0 += z1 + z3; o1 += z2 + z4; o2 += z2 + z3; o3 += z1 + z4;
+		const int S = CONST_BITS + PASS1_BITS + 3, R = 1 << (S - 1);
+		o[0] = clip8(((t10 + o3 + R) >> S) + 128);  o[7] = clip8(((t10 - o3 + R) >> S) + 128);
+		o[1] = clip8(((t11 + o2 + R) >> S) + 128);  o[6] = clip8(((t11 - o2 + R) >> S) + 128);
+		o[2] = clip8(((t12 + o1 + R) >> S) + 128);  o[5] = clip8(((t12 - o1 + R) >> S) + 128);
+		o[3] = clip8(((t13 + o0 + R) >> S) + 128);  o[4] = clip8(((t13 - o0 + R) >> S) + 128);
 	}
 }
 
 // 1 成分の記述
 struct Comp {
 	int h, v;                  // サンプリング (MCU 内ブロック数 = h*v)
-	const tjs_uint8 *quant;    // 量子化テーブル (ジグザグ順, 64)
+	const tjs_uint8 *quant;    // 量子化テーブル (自然順, 64。ファイルの並びのまま)
 	const HuffTable *dc, *ac;  // Huffman テーブル
 	int  predIdx;              // DC 予測子インデックス (0=luma,1=chroma)
 	int  pw, ph;               // 成分プレーンの実サイズ
 	std::vector<tjs_uint8> plane;
 };
 
-// 1 ブロック復号 → 自然順の逆量子化係数
-static void decodeBlock(BitReader &br, const Comp &c, int &pred, int *coef) {
+// 1 ブロック復号 → 自然順の量子化係数 (逆量子化は IDCT で行う)
+//   戻り値: 最後に処理した係数位置+1。AC が 1 つも無いブロックは 1
+static int decodeBlock(BitReader &br, const Comp &c, int &pred, int *coef) {
 	memset(coef, 0, 64 * sizeof(int));
 	int t = br.decode(*c.dc);
 	int diff = receive_extend(br, t);
 	pred += diff;
-	coef[0] = pred * c.quant[0];        // DC (zigzag0 = natural0)
+	coef[0] = pred;
 	int k = 1;
 	while (k < 64) {
 		int rs = br.decode(*c.ac);
@@ -255,22 +292,25 @@ static void decodeBlock(BitReader &br, const Comp &c, int &pred, int *coef) {
 		}
 		k += r;
 		if (k > 63) break;
-		int val = receive_extend(br, s);
-		coef[ZIGZAG[k]] = val * c.quant[k];      // 逆量子化 (ともにジグザグ順)
+		coef[ZIGZAG[k]] = receive_extend(br, s);
 		k++;
 	}
+	return k;
 }
 
 // インターリーブ・スキャンをまるごと復号し、各成分プレーンを埋める。
 //   fw,fh : フレーム画素サイズ (16 の倍数)。comps は SOS 順。
 //   予測子は predIdx 単位で共有、フレーム先頭で 0 リセット (非標準仕様の再現)。
+//   MCU 内の全ブロックが AC 無しなら、オリジナルと同じく (DC*q >> 3) + 128 で
+//   ブロックを塗る (IDCT の丸めと 1 違うことがあるので経路を揃える)。
 static void decodeScan(const tjs_uint8 *entropy, size_t elen,
 					   int fw, int fh, std::vector<Comp> &comps) {
-	initCos();
 	int hmax = 1, vmax = 1;
+	int nblocks = 0;
 	for (size_t i = 0; i < comps.size(); i++) {
 		if (comps[i].h > hmax) hmax = comps[i].h;
 		if (comps[i].v > vmax) vmax = comps[i].v;
+		nblocks += comps[i].h * comps[i].v;
 	}
 	int mcuW = fw / (hmax * 8);
 	int mcuH = fh / (vmax * 8);
@@ -283,17 +323,30 @@ static void decodeScan(const tjs_uint8 *entropy, size_t elen,
 
 	BitReader br(entropy, elen);
 	int pred[2] = { 0, 0 };
-	int coef[64];
+	std::vector<int> coefs((size_t)nblocks * 64);
 	tjs_uint8 blk[64];
 
 	for (int my = 0; my < mcuH; my++) {
 		for (int mx = 0; mx < mcuW; mx++) {
+			// MCU 内の全ブロックを先に復号
+			int bi = 0, ksum = 0;
+			for (size_t ci = 0; ci < comps.size(); ci++) {
+				Comp &c = comps[ci];
+				for (int b = 0; b < c.h * c.v; b++, bi++)
+					ksum += decodeBlock(br, c, pred[c.predIdx], &coefs[(size_t)bi * 64]);
+			}
+			const bool dcOnly = (ksum == nblocks);
+			bi = 0;
 			for (size_t ci = 0; ci < comps.size(); ci++) {
 				Comp &c = comps[ci];
 				for (int by = 0; by < c.v; by++) {
-					for (int bx = 0; bx < c.h; bx++) {
-						decodeBlock(br, c, pred[c.predIdx], coef);
-						idct8x8(coef, blk);
+					for (int bx = 0; bx < c.h; bx++, bi++) {
+						const int *coef = &coefs[(size_t)bi * 64];
+						if (dcOnly) {
+							memset(blk, clip8(((coef[0] * c.quant[0]) >> 3) + 128), 64);
+						} else {
+							idctIslow(coef, c.quant, blk);
+						}
 						int px = (mx * c.h + bx) * 8;
 						int py = (my * c.v + by) * 8;
 						for (int r = 0; r < 8; r++)
@@ -303,6 +356,13 @@ static void decodeScan(const tjs_uint8 *entropy, size_t elen,
 			}
 		}
 	}
+}
+
+// YCbCr → RGB (libjpeg の丸め付きテーブルと同じ式。オリジナルもこれ)
+static inline void ycc2rgb(int yy, int cb, int cr, int &r, int &g, int &b) {
+	r = yy + ((91881  * (cr - 128) + 32768) >> 16);
+	g = yy + ((-22554 * (cb - 128) - 46802 * (cr - 128) + 32768) >> 16);
+	b = yy + ((116130 * (cb - 128) + 32768) >> 16);
 }
 
 } // namespace amvdec
@@ -419,7 +479,7 @@ public:
 			(!IsZlibAlpha && QuantSize != 0xc0))
 			TVPThrowExceptionMessage(TJS_W("Invalid Quantaization table size."));
 
-		// 量子化テーブル (各 64 バイト, ジグザグ順で格納)
+		// 量子化テーブル (各 64 バイト, 自然順で格納。オリジナルも並べ替えずに IDCT で使う)
 		tjs_uint8 qbuf[0xc0];
 		seekRead(0x28, qbuf, QuantSize);
 		memcpy(Quant[0], qbuf + 0,   64);   // table0 : Y luma
@@ -576,8 +636,10 @@ private:
 		ftop  = rdS16(fh20 + 14);
 		fw    = rdU16(fh20 + 16);
 		fh    = rdU16(fh20 + 18);
-		if ((fw & 0x0f) || (fh & 0x0f) || fw <= 0 || fh <= 0)
+		if ((fw & 0x0f) || (fh & 0x0f))
 			TVPThrowExceptionMessage(TJS_W("File format error."));
+		// 大きさ 0 の空フレーム (先頭に置かれることがある) はオリジナル同様に通す
+		if (fw == 0 || fh == 0) { bgra.clear(); return; }
 
 		tjs_uint payloadLen = size - 12;
 		std::vector<tjs_uint8> entropy(payloadLen ? payloadLen : 1);
@@ -599,7 +661,7 @@ private:
 
 		amvdec::decodeScan(&entropy[0], payloadLen, fw, fh, comps);
 
-		// 合成: Y,Cb,Cr,A → BGRA (Cb,Cr は 1/2 解像度なので x/2,y/2 参照)
+		// 合成: Y,Cb,Cr,A → BGRA (Cb,Cr は 1/2 解像度なので x/2,y/2 参照 = 最近傍。オリジナルと同じ)
 		bgra.assign((size_t)fw * fh * 4, 0);
 		const amvdec::Comp &Cb = comps[0], &Cr = comps[1], &Y = comps[2], &A = comps[3];
 		for (tjs_int y = 0; y < fh; y++) {
@@ -613,9 +675,8 @@ private:
 				int cb = cbr[x / 2];
 				int cr = crr[x / 2];
 				int a  = ar[x];
-				int r = yy + ((91881  * (cr - 128)) >> 16);
-				int g = yy - ((22554  * (cb - 128) + 46802 * (cr - 128)) >> 16);
-				int b = yy + ((116130 * (cb - 128)) >> 16);
+				int r, g, b;
+				amvdec::ycc2rgb(yy, cb, cr, r, g, b);
 				dst[0] = clip8(b);
 				dst[1] = clip8(g);
 				dst[2] = clip8(r);
@@ -642,8 +703,10 @@ private:
 		fw    = rdU16(fh24 + 16);
 		fh    = rdU16(fh24 + 18);
 		tjs_uint32 alphaZlibLen  = rdU32(fh24 + 20);
-		if ((fw & 0x0f) || (fh & 0x0f) || fw <= 0 || fh <= 0)
+		if ((fw & 0x0f) || (fh & 0x0f))
 			TVPThrowExceptionMessage(TJS_W("File format error."));
+		// 大きさ 0 の空フレーム (先頭に置かれることがある) はオリジナル同様に通す
+		if (fw == 0 || fh == 0) { bgra.clear(); return; }
 
 		// alpha(zlib) が先
 		std::vector<tjs_uint8> alphaZ(alphaZlibLen ? alphaZlibLen : 1);
@@ -692,9 +755,8 @@ private:
 				int yy = yr[x];
 				int cb = cbr[x / 2];
 				int cr = crr[x / 2];
-				int r = yy + ((91881  * (cr - 128)) >> 16);
-				int g = yy - ((22554  * (cb - 128) + 46802 * (cr - 128)) >> 16);
-				int b = yy + ((116130 * (cb - 128)) >> 16);
+				int r, g, b;
+				amvdec::ycc2rgb(yy, cb, cr, r, g, b);
 				dst[0] = clip8(b);
 				dst[1] = clip8(g);
 				dst[2] = clip8(r);
@@ -704,32 +766,55 @@ private:
 	}
 
 	//----------------------------------------------------------- レイヤ描画
-	// 内部 BGRA バッファ (fw*fh) を Layer のメイン画像へ上書きコピー。
-	// 書き込み左上 = (this.Left + fleft, this.Top + ftop)。範囲外はクリップ。
+	// オリジナルと同じく、描画先レイヤをフレームの大きさ (fw x fh) に合わせ
+	// (setImageSize / setSize)、位置を (Left + fleft, Top + ftop) へ移し (setPos)、
+	// 画像の左上からフレームを書き込んで update する。visible は変更しない。
+	// (レイヤのサイズを変えずに書くと、新規 Layer の既定 32x32 に切り詰められる)
 	void blitToLayer(iTJSDispatch2 *layer, std::vector<tjs_uint8> &bgra,
 					 tjs_int fleft, tjs_int ftop, tjs_int fw, tjs_int fh)
 	{
+		if (!layer || TJS_FAILED(layer->IsInstanceOf(0, 0, 0, TJS_W("Layer"), layer)))
+			TVPThrowExceptionMessage(TJS_W("AlphaMovie: target must be a Layer."));
+
+		// 空フレーム: オリジナルは表示上の大きさだけ 0x0 にする (画像サイズ・位置はそのまま)
+		if (fw <= 0 || fh <= 0) {
+			callLayer(layer, TJS_W("setSize"), 0, 0);
+			return;
+		}
+		if (getLayerInt(layer, TJS_W("hasImage")) == 0) {
+			tTJSVariant v((tjs_int)1);
+			layer->PropSet(0, TJS_W("hasImage"), 0, &v, layer);
+		}
+		if (getLayerInt(layer, TJS_W("imageWidth")) != fw || getLayerInt(layer, TJS_W("imageHeight")) != fh)
+			callLayer(layer, TJS_W("setImageSize"), fw, fh);
+		if (getLayerInt(layer, TJS_W("width")) != fw || getLayerInt(layer, TJS_W("height")) != fh)
+			callLayer(layer, TJS_W("setSize"), fw, fh);
+		tjs_int px = Left + fleft, py = Top + ftop;
+		if (getLayerInt(layer, TJS_W("left")) != px || getLayerInt(layer, TJS_W("top")) != py)
+			callLayer(layer, TJS_W("setPos"), px, py);
+
 		tjs_int lw, lh, pitch;
 		tjs_uint8 *lbuf;
 		if (!getLayerWriteBuffer(layer, lw, lh, lbuf, pitch))
 			TVPThrowExceptionMessage(TJS_W("AlphaMovie: target must be a Layer with image."));
 
-		tjs_int dx0 = Left + fleft;
-		tjs_int dy0 = Top + ftop;
+		tjs_int cw = fw < lw ? fw : lw;
+		tjs_int ch = fh < lh ? fh : lh;
+		for (tjs_int y = 0; y < ch; y++)
+			memcpy(lbuf + (size_t)y * pitch, &bgra[(size_t)y * fw * 4], (size_t)cw * 4);
 
-		tjs_int sx = 0, sy = 0;
-		tjs_int cw = fw, ch = fh;
-		if (dx0 < 0) { sx = -dx0; cw += dx0; dx0 = 0; }
-		if (dy0 < 0) { sy = -dy0; ch += dy0; dy0 = 0; }
-		if (dx0 + cw > lw) cw = lw - dx0;
-		if (dy0 + ch > lh) ch = lh - dy0;
-		if (cw <= 0 || ch <= 0) return;
+		layer->FuncCall(0, TJS_W("update"), 0, 0, 0, 0, layer);
+	}
 
-		for (tjs_int y = 0; y < ch; y++) {
-			const tjs_uint8 *src = &bgra[(size_t)(sy + y) * fw * 4 + (size_t)sx * 4];
-			tjs_uint8 *dst = lbuf + (size_t)(dy0 + y) * pitch + (size_t)dx0 * 4;
-			memcpy(dst, src, (size_t)cw * 4);
-		}
+	static tjs_int getLayerInt(iTJSDispatch2 *lay, const tjs_char *name) {
+		tTJSVariant v;
+		if (TJS_FAILED(lay->PropGet(0, name, 0, &v, lay))) return -1;
+		return (tjs_int)v.AsInteger();
+	}
+	static void callLayer(iTJSDispatch2 *lay, const tjs_char *name, tjs_int a, tjs_int b) {
+		tTJSVariant va(a), vb(b);
+		tTJSVariant *params[2] = { &va, &vb };
+		lay->FuncCall(0, name, 0, 0, 2, params, lay);
 	}
 };
 
